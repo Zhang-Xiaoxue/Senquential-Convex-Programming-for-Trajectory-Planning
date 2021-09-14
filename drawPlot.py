@@ -11,9 +11,7 @@ from Scenarios import Scenario
 from Scenarios import Indices
 from plotOnline import transformedRectangle
 
-# mypath = 'C:\\Users\\Lisnol\\National University of Singapore\\Ma Jun - Research-XX\\SCP\\Revise1\\'
-# mypath = 'D:\\SoftWare\\DropBox\\Dropbox\\[5]SCP\\paper\\'
-mypath = 'C:/Users/Lisnol/National University of Singapore/Ma Jun - Research-XX/SCP/Final/'
+mypath = os.getcwd()
 
 # %%
 # load data to plot figure 1-4
