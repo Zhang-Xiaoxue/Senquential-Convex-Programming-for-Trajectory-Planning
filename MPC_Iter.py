@@ -4,6 +4,7 @@ from math import floor,cos,sin
 import ode
 import scipy as sci
 from sympy import Matrix
+from scipy import linalg
 
 from Scenarios import Indices
 from SampleReferTraj import sampleReferenceTrajectory
@@ -12,7 +13,6 @@ from SampleReferTraj import sampleReferenceTrajectory
 class IterClass():
     def __init__(self, scenario, x_measured, u_path, obstacleState, uMax):
         """ 
-        arguments: u_path is a list w.r.t nVeh, each indice is a matrix 
         self.x0: array (nVeh, 6)
         """
         idx = Indices()
@@ -70,11 +70,13 @@ class MPCclass():
         self.A = np.zeros([nx,nx,Hp,nVeh])
         self.B = np.zeros([nx,nu,Hp,nVeh])
         self.E = np.zeros([nx,Hp,nVeh])
-        self.Theta = np.zeros([ny*Hp,nu*Hu,nVeh])
-        self.H = np.zeros([nu*Hu,nu*Hu,nVeh])
-        self.g = np.zeros([nu*Hu,1,nVeh])
-        self.r = np.zeros([1,nVeh])
-        self.freeResponse = np.zeros([ny*Hp,1,nVeh])
+        self.Mathcal_A = np.zeros([ny*Hp,nx, nVeh])
+        self.Mathcal_B = np.zeros([ny*Hp,nu*Hu,nVeh]) 
+        self.Mathcal_C = np.zeros([ny*Hp,1,nVeh])
+        self.Phi_0 = np.zeros([nu*Hu,nu*Hu,nVeh]) 
+        self.Psi_0 = np.zeros([nu*Hu,1,nVeh]) 
+        self.gamma_0 = np.zeros([1,nVeh]) 
+        self.const_term = np.zeros([ny*Hp,1,nVeh])
         self.Reference = np.zeros([Hp*ny,nVeh])
 
         for v in range(nVeh):
@@ -83,32 +85,24 @@ class MPCclass():
 
             A,B,C,E = self.discretize( Iter.x0[v,:], Iter.u0[v,:], scenario.Lf[v], scenario.Lr[v], dt, scenario.model )
             E[abs(E)<=1e-30]=0
-            Psi, Gamma, self.Theta[:,:,v], Pie = self.prediction_matrices( A,B,C,nx,nu,ny,Hp,Hu )  
+            self.Mathcal_A[:,:,v], self.Mathcal_C[:,:,v], self.Mathcal_B[:,:,v] = self.prediction_matrices( A,B,C,E, nx,nu,ny,Hp,Hu )  
 
-            self.freeResponse[:,:,v] = Psi @ Iter.x0[v,:].reshape(-1,1) + Gamma * Iter.u0[v,:].T + Pie @ E
+            self.const_term[:,:,v] = self.Mathcal_A[:,:,v] @ Iter.x0[v,:].reshape(-1,1) + self.Mathcal_C[:,:,v] # Constant term
 
-            self.H[:,:,v] , self.g[:,:,v], self.r[:,v] = self.mpc_cost_function_matrices( scenario.Q[v], scenario.R[v], nu,ny,Hp,Hu, v, scenario.Q_final[v] )
+            self.Phi_0[:,:,v] , self.Psi_0[:,:,v], self.gamma_0[:,v] = self.mpc_cost_function_matrices( scenario.Q[v], scenario.R[v], nu,ny,Hp,Hu, v, scenario.Q_final[v] )
 
-            # For the simple linearization, the same A,B,E are used in every prediction step.
             for i in range(Hp):
                 self.A[:,:,i,v] = A
                 self.B[:,:,i,v] = B
                 self.E[:,i,v] = np.squeeze(E)
 
     def discretize(self,x0,u0,Lf,Lr, dt, model ):
-        # Compute the linearization and discretization of a non-linear continous model with a known jacobian around a given point.
-        # Model form: dx/dt = f(x,u)
-        # Discretization form: x(k+1) = Ad*x(k) + Bd*u(k) + Ed
         
         if x0.shape[0]==1:
             x0=x0.T
         
         Ac,Bc,Cc,Ec = model.comp_jacobian(x0,u0,Lf,Lr)
 
-        # Formula from wikipedia https://en.wikipedia.org/wiki/Discretization#cite_ref-1
-        # expm([A B; 0 0] * dt) == [Ad Bd; 0 eye]
-        # Cited from
-        # Raymond DeCarlo: Linear Systems: A State Variable Approach with Numerical Implementation, Prentice Hall, NJ, 1989, page 215
         tmp = sci.linalg.expm(dt*np.vstack([ np.hstack([Ac,Bc]), np.zeros([Ac.shape[1]+Bc.shape[1]-Ac.shape[0],Ac.shape[1]+Bc.shape[1]])] ))
         Ad = tmp[0:Ac.shape[0],0:Ac.shape[1]]
         Bd = tmp[0:Bc.shape[0],Ac.shape[1]:Ac.shape[1]+Bc.shape[1]]
@@ -126,33 +120,31 @@ class MPCclass():
             Q[i, i] = Q_final
         
         R = R_weight * np.eye(nu*Hu)
-        Error = self.Reference[:,idx_veh].reshape(-1,1) - self.freeResponse[:,:,idx_veh]
-        H = 0.5*((self.Theta[:,:,idx_veh].T @ Q @ self.Theta[:,:,idx_veh] + R)+(self.Theta[:,:,idx_veh].T @ Q @ self.Theta[:,:,idx_veh] + R).T)
-        g = -2*self.Theta[:,:,idx_veh].T@Q@Error
-        r = Error.T @ Q @ Error
-        return H, g, r
+        Error = self.Reference[:,idx_veh].reshape(-1,1) - self.const_term[:,:,idx_veh]
+        Phi_0 = 0.5*((self.Mathcal_B[:,:,idx_veh].T @ Q @ self.Mathcal_B[:,:,idx_veh] + R)+(self.Mathcal_B[:,:,idx_veh].T @ Q @ self.Mathcal_B[:,:,idx_veh] + R).T)
+        Psi_0 = -2*self.Mathcal_B[:,:,idx_veh].T@Q@Error
+        gamma_0 = Error.T @ Q @ Error
+        return Phi_0, Psi_0, gamma_0
 
-    def prediction_matrices(self, A,B,C,nx,nu,ny,Hp, Hu):
+    def prediction_matrices(self, A,B,C,E,nx,nu,ny,Hp, Hu):
         assert (Hu <= Hp)
-        Theta = np.zeros([ny*Hp,nu*Hu])
-        Psi = np.zeros([ny*Hp,nx])
-        Gamma = np.zeros([ny*Hp,nu])
-        Pie = np.zeros([ny*Hp,nx])
+        Mathcal_B = np.zeros([ny*Hp,nu*Hu]) 
+        Mathcal_A = np.zeros([ny*Hp,nx]) 
+        Mathcal_C = np.zeros([ny*Hp,nu])
 
-        powersCA = np.zeros([ny,nx,Hp+1])
-        powersCA[:,:,0] = C@np.eye(nx)
-        summedPowersCA = np.zeros([ny,nx,Hp+1])
-        summedPowersCA[:,:,0] = C@np.eye(nx)
+        power_C_A = np.zeros([ny,nx,Hp+1])
+        power_C_A[:,:,0] = C@np.eye(nx)
+        sum_power_C_A = np.zeros([ny,nx,Hp+1])
+        sum_power_C_A[:,:,0] = C@np.eye(nx)
         for i in range(1,Hp+1):
-            powersCA[:,:,i] = C @ np.linalg.matrix_power(A,i)
-            summedPowersCA[:,:,i] = powersCA[:,:,i] + summedPowersCA[:,:,i-1]
+            power_C_A[:,:,i] = C @ np.linalg.matrix_power(A,i) # CA^i
+            sum_power_C_A[:,:,i] = power_C_A[:,:,i] + sum_power_C_A[:,:,i-1] # sum_i(CA^i)
         
         for i in range(Hp):
-            Psi[slice(ny*(i),ny*(i+1),1),:] = powersCA[:,:,i+1]
-            Gamma[slice(ny*(i),ny*(i+1),1),:] = summedPowersCA[:,:,i]@B
-            for iu in range(min(i,Hu)+1):
-                Theta[slice(ny*(i),ny*(i+1),1), slice(nu*(iu),nu*(iu+1),1)] =  summedPowersCA[:,:,i-iu]@B
-            Pie[slice(ny*(i),ny*(i+1),1),:] = summedPowersCA[:,:,i]
+            Mathcal_A[slice(ny*(i),ny*(i+1),1),:] = power_C_A[:,:,i+1]
+            Mathcal_C[slice(ny*(i),ny*(i+1),1),:] = sum_power_C_A[:,:,i]@E
+            for j in range(i+1):
+                Mathcal_B[slice(ny*(i),ny*(i+1),1), slice(nu*(j),nu*(j+1),1)] =  power_C_A[:,:,i-j]@B
         
-        return Psi, Gamma, Theta, Pie
+        return Mathcal_A, Mathcal_C, Mathcal_B
 

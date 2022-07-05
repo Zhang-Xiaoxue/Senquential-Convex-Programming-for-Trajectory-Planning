@@ -18,7 +18,7 @@ cfg = Config()
 class SCPcontroller():
     def __init__(self, scenario, Iter, prevOutput):
 
-        self.dsafeExtra = 2
+        # self.dsafeExtra = 2
 
         self.scenario = scenario
         self.Iter = Iter
@@ -27,155 +27,139 @@ class SCPcontroller():
         self.nu = scenario.model.nu
         self.ny = scenario.model.ny
         self.Hp = scenario.Hp
-        self.Hu = scenario.Hu
         self.nVeh = scenario.nVeh
         self.nObst = scenario.nObst
         self.dsafeExtra = scenario.dsafeExtra
 
-        self.scenario_duLim = scenario.duLim
+        self.scenario_uLim = scenario.uLim
 
         self.mpc = MPCclass(scenario, Iter)
-        self.qcqp = self.convert_to_QCQP(scenario)
-        self.du = np.zeros([self.nVeh*self.Hu,1])
+        self.qcqp = self.QCQP_formulate(scenario)
+        self.u = np.zeros([self.nVeh*self.Hp,1])
     
     def SCP_controller(self, Iter):
-        init_method = 'previous'
-        # if hasattr(self.scenario, 'SCP_init_method'):
-        #     init_method = self.scenario.SCP_init_method
         
-        if (init_method == 'previous') and self.prevOutput and ('du' in self.prevOutput):
-            self.du = self.prevOutput['du']
-            self.du = self.du.reshape([self.Hu,self.nVeh],order='F')
-            self.du[0:-1,:] = self.du[1:self.Hu,:]
-            self.du[-1,:] = 0
-            self.du = self.du.reshape([self.Hu*self.nVeh,1],order='F')
-        
+        if self.prevOutput and ('u' in self.prevOutput):
+            self.u = self.prevOutput['u'].reshape([self.Hp*self.nVeh,1],order='F')
+         
         controllerOutput = {}
         controllerOutput['resultInvalid'] = False
         optimizerTimer = time.time()
         
-        # try last MPC sol.
-        self.du, feasible , _, controllerOutput['optimization_log'] = self.SCP_optimizer( self.du )
-        # heuristic: try left and right if no. of veh. is 1
+        self.u, feasible , _, controllerOutput['optimization_log'] = self.SCP_optimizer( self.u )
+
         if self.nVeh == 1: 
             if feasible == False:
                 # try left
-                self.du = np.ones([self.du.shape[0],self.du.shape[0]])*self.scenario_duLim
-                du_pos , feasible_pos, _ = self.SCP_optimizer( self.du )
+                self.u = np.ones([self.u.shape[0],self.u.shape[0]])*self.scenario_uLim
+                u_pos , feasible_pos, _ = self.SCP_optimizer( self.u )
                 if feasible_pos :
-                    self.du = du_pos
+                    self.u = u_pos
                 else:
                     # try right
-                    self.du = -np.ones([self.du.shape[0],self.du.shape[0]])*self.scenario_duLim
-                    du_neg , feasible_neg, _ = self.SCP_optimizer( self.du )
+                    self.u = -np.ones([self.u.shape[0],self.u.shape[0]])*self.scenario_uLim
+                    u_neg , feasible_neg, _ = self.SCP_optimizer( self.u )
                     if feasible_neg:
-                        self.du = du_neg
+                        self.u = u_neg
                     else:
                         print('INFEASIBLE PROBLEM')
                         controllerOutput['resultInvalid'] = True
         
-        controllerOutput['du'] = self.du
-        trajectoryPrediction, U = self.decode_deltaU(self.du)  # U: (14,1,8)
+        controllerOutput['u'] = self.u
+        trajectoryPrediction, U = self.forward_U(self.u)  # U: (14,1,8)
         U = np.squeeze(U[:,0,:])
         controllerOutput['optimizerTime'] = time.time() - optimizerTimer
         return U, trajectoryPrediction, controllerOutput
     
-    def SCP_optimizer(self, x_0):
-        if abs(x_0[0,0]) < np.spacing(1): # avoid numerical issues
-            x_0[0] = np.spacing(1)
+    def SCP_optimizer(self, u_approx):
+        if abs(u_approx[0,0]) < np.spacing(1): # avoid numerical issues
+            u_approx[0] = np.spacing(1)
 
-        n_du = x_0.shape[0]
-        nVars = x_0.shape[0]+1
-        nCons = int(self.nVeh * ( self.Hp*(self.nVeh-1)/2 + self.Hp*self.nObst + 2*self.Hu ))
+        num_var = u_approx.shape[0]
+        num_var_add_omega = u_approx.shape[0]+1
+        num_constr = int(self.nVeh * ( self.Hp*(self.nVeh-1)/2 + self.Hp*self.nObst))
 
-        _, objValue_0, _, _, max_violation_0, _, _, _ = self.QCQP_evaluate(x_0)
-        delta_tol = 1e-4
-        slack_weight = 1e5
-        slack_ub = 1e30
-        slack_lb = 0
+        _, objValue_0, _, _, max_violation_0, _, _, _ = self.QCQP_evaluate(u_approx)
+        delta_tol = 1e-3
+        psi_omega_weight = 1e5
+        upper_bound_omega, lower_bound_omega = 1e25, 0
         max_SCP_iter = 20
 
         optimization_log = {'P':[], 'q':[], 'Aineq':[], 'bineq':[], 'lb':[], 'ub':[], 'x':[], 'slack':[],
-                            'SCP_ObjVal':[], 'QCQP_ObjVal':[], 'delta_hat':[], 'delta':[], 'du':[], 'feasible':[],
-                            'prev_du':[], 'Traj':[], 'U':[], 'prevTraj':[], 'prevU':[]}
+                            'SCP_ObjVal':[], 'QCQP_ObjVal':[], 'delta_hat':[], 'delta':[], 'u':[], 'feasible':[],
+                            'prev_u':[], 'Traj':[], 'U':[], 'prevTraj':[], 'prevU':[]}
 
         for i in range(max_SCP_iter):
-            Aineq = np.zeros([nCons,nVars])
-            bineq = np.zeros([nCons,1])
+            Aineq = np.zeros([num_constr,num_var_add_omega]) 
+            bineq = np.zeros([num_constr,1])
             row = 0
             # VEHICLE AVOIDANCE
-            for v in range(self.nVeh-1):
-                for v2 in range(v+1,self.nVeh):
+            for i in range(self.nVeh-1):
+                for j in range(i+1,self.nVeh): # host vehicle is connected with the following vehicles.
                     for k in range(self.Hp):
-                        Aineq[row,0:n_du] = (self.qcqp['q'][v,v2,k].T + 2*x_0.T @ self.qcqp['p'][v,v2,k])
-                        bineq[row,0] = -(self.qcqp['r'][v,v2,k]-x_0.T@self.qcqp['p'][v,v2,k]@x_0)
+                        Aineq[row,0:num_var] = (self.qcqp['Psi'][i,j,k].T + 2*u_approx.T @ self.qcqp['Phi'][i,j,k])
+                        bineq[row,0] = -(self.qcqp['gamma'][i,j,k]-u_approx.T@self.qcqp['Phi'][i,j,k]@u_approx)
                         row += 1
+            # if (A == Aineq): print("true")
 
             # OBSTACLE AVOIDANCE
             if self.nObst:
-                for v in range(self.nVeh):
+                # A_matrix_obs = [self.qcqp['q_o'][i,o,k].T + 2*u_approx.T @ self.qcqp['p_o'][i,o,k] for i in range(self.nVeh) for o in range(self.nObst) for k in range(self.Hp)]
+                # b_vector_obs = [-(self.qcqp['r_o'][i,o,k]-u_approx.T @ self.qcqp['p_o'][i,o,k] @ u_approx) for i in range(self.nVeh) for o in range(self.nObst) for k in range(self.Hp)]
+                for i in range(self.nVeh):
                     for o in range(self.nObst):
                         for k in range(self.Hp):
-                            Aineq[row,slice(0,n_du,1)] = (self.qcqp['q_o'][v,o,k].T + 2*x_0.T @ self.qcqp['p_o'][v,o,k])
-                            bineq[row,0] = -(self.qcqp['r_o'][v,o,k]-x_0.T @ self.qcqp['p_o'][v,o,k] @ x_0)
+                            Aineq[row,slice(0,num_var,1)] = (self.qcqp['Psi_o'][i,o,k].T + 2*u_approx.T @ self.qcqp['Phi_o'][i,o,k])
+                            bineq[row,0] = -(self.qcqp['gamma_o'][i,o,k]-u_approx.T @ self.qcqp['Phi_o'][i,o,k] @ u_approx)
                             row += 1
+            # A_matrix = A_matrix_vehicle + A_matrix_obs
+            # b_vector = b_vector_vehicle + b_vector_obs
             
-            # U limits
-            for v in range(self.nVeh):
-                row_slice = slice(row, row+self.Hu,1)
-                Aineq[row_slice,slice(v*(self.nu*self.Hu),(v+1)*(self.nu*self.Hu),1)] = np.tril(np.ones([self.Hu,self.Hu]))
-                bineq[row_slice,0] = -self.Iter.u0[v,:] + self.Iter.uMax[:,v]
-                
-                row_slice1 = slice(row+self.Hu, row+self.Hu+self.Hu,1)
-                Aineq[row_slice1,slice(v*(self.nu*self.Hu),(v+1)*(self.nu*self.Hu),1)] =  -(np.tril(np.ones([self.Hu,self.Hu])))
-                bineq[row_slice1,0] = -(-self.Iter.u0[v,:] - self.Iter.uMax[:,v])
-                row = row+self.Hu+self.Hu
-            
-            lb = -np.ones([n_du,1])*self.scenario_duLim
-            ub =  np.ones([n_du,1])*self.scenario_duLim
-            P = 2*self.qcqp['p0']
+            lb = -np.ones([num_var,1])*self.scenario_uLim
+            ub =  np.ones([num_var,1])*self.scenario_uLim
+            P = 2*self.qcqp['Phi0']
             
             # slack var
-            q = np.vstack([self.qcqp['q0'], slack_weight])
+            q = np.vstack([self.qcqp['Psi0'], psi_omega_weight])
             P = sci.linalg.block_diag(P,0)
-            Aineq[0:nCons-2*self.Hu*self.nVeh,-1] = -1 # <--  enable slack var just for collision avoidance constraints
-            lb = np.vstack([lb, slack_lb])
-            ub = np.vstack([ub, slack_ub])
+            Aineq[0:num_constr,-1] = -1 # <--  enable slack var just for collision avoidance constraints
+            lb = np.vstack([lb, lower_bound_omega])
+            ub = np.vstack([ub, upper_bound_omega])
             Aineq[abs(Aineq)<=1e-20] = 0
 
             # res = {'P_py': P, 'q_py':q, 'Aineq_py':Aineq, 'bineq_py':bineq, 'lb_py':lb, 'ub_py':ub, \
             #        'qcqp_p':self.qcqp['p'], 'qcqp_q':self.qcqp['q'], 'qcqp_r':self.qcqp['r'], \
-            #        'qcqp_q0':self.qcqp['q0'], 'qcqp_p0':self.qcqp['p0'], 'qcqp_r0':self.qcqp['r0']}
+            #        'qcqp_Psi0':self.qcqp['Psi0'], 'qcqp_Phi0':self.qcqp['Phi0'], 'qcqp_gamma0':self.qcqp['gamma0']}
             # io.savemat('res_py.mat', res)
 
-            x = cp.Variable([P.shape[0],1])
-            cost = 0.5*cp.quad_form(x,P) + q.T@x
-            constr = [Aineq@x <= bineq]
-            constr += [x <= ub]
-            constr += [x >= lb]
+            u_var = cp.Variable([P.shape[0],1])
+            cost = 0.5*cp.quad_form(u_var,P) + q.T@u_var
+            constr = [Aineq@u_var <= bineq]
+            constr += [u_var <= ub]
+            constr += [u_var >= lb]
             prob = cp.Problem(cp.Minimize(cost), constr)
             res = prob.solve(solver=cp.GUROBI, verbose=False)
             # if not res :
             #     print('wowowowowowowow------------cplex failed!')
             #     res = prob.solve(solver=cp.CVXOPT, verbose=True)
-            x = x.value
+            u_var = u_var.value
             fval = prob.value
 
-            slack = x[-1]
-            prev_x = x_0
-            x_0 = x[0:-1]
+            slack = u_var[-1]
+            prev_x = u_approx
+            u_approx = u_var[0:-1]
             # Eval. progress
-            feasible, objValue, _, _, max_violation, sum_violations, constraintValuesVehicle, constraintValuesObstacle = self.QCQP_evaluate(x_0)
+            feasible, objValue, _, _, max_violation, sum_violations, constraintValuesVehicle, constraintValuesObstacle = self.QCQP_evaluate(u_approx)
             
             if self.nObst:
                 max_constraint = max(constraintValuesVehicle.max(), constraintValuesObstacle.max() ) 
             else:
                 max_constraint = 0 # since no obstacles
             
-            fval = fval + self.qcqp['r0']
-            delta_hat = (objValue_0 + slack_weight*max_violation_0) - fval # predicted decrease of obj
-            delta = (objValue_0 + slack_weight*max_violation_0) - (objValue + slack_weight*max_violation) # real decrease of obj
-            print('slack %8f max_violation %8f sum_violations %8f feas %d objVal %8f fval %8f max_constraint %e\n' %(slack, max_violation, sum_violations, feasible, objValue, fval, max_constraint) )
+            fval = fval + self.qcqp['gamma0']
+            delta_hat = (objValue_0 + psi_omega_weight*max_violation_0) - fval # predicted decrease of obj
+            delta = (objValue_0 + psi_omega_weight*max_violation_0) - (objValue + psi_omega_weight*max_violation) # real decrease of obj
+            print('slack %8f sum_violations %8f feasible %d objVal %8f fval %8f \n' %(slack,  sum_violations, feasible, objValue, fval) )
             
             objValue_0 = objValue
             max_violation_0 = max_violation
@@ -188,19 +172,19 @@ class SCPcontroller():
             optimization_log['bineq'].append(bineq)
             optimization_log['lb'].append(lb)
             optimization_log['ub'].append(ub)
-            optimization_log['x'].append(x)
+            optimization_log['x'].append(u_var)
             optimization_log['slack'].append(slack)
             optimization_log['SCP_ObjVal'].append(fval)
             optimization_log['QCQP_ObjVal'].append(objValue)
             optimization_log['delta_hat'].append(delta_hat)
             optimization_log['delta'].append(delta)
-            optimization_log['du'].append(x_0)
+            optimization_log['u'].append(u_approx)
             optimization_log['feasible'].append(feasible)
-            optimization_log['prev_du'].append(prev_x)
-            log_Traj, log_U = self.decode_deltaU(x_0)
+            optimization_log['prev_u'].append(prev_x)
+            log_Traj, log_U = self.forward_U(u_approx)
             optimization_log['Traj'].append(log_Traj)
             optimization_log['U'].append(log_U)
-            log_prevTraj, log_prevU = self.decode_deltaU(prev_x)
+            log_prevTraj, log_prevU = self.forward_U(prev_x)
             optimization_log['prevTraj'].append(log_prevTraj)
             optimization_log['prevU'].append(log_prevU)
             
@@ -210,31 +194,25 @@ class SCPcontroller():
             if  (abs(delta) < delta_tol) and (max_violation <= cfg.QCQP.constraintTolerance): # max_violation is constraintTolerance in QCQP_evaluate.m.
                 break
         print('iterations: ', i)
-        return x_0 , feasible, objValue[0,0], optimization_log
+        return u_approx , feasible, objValue[0,0], optimization_log
     
-    def decode_deltaU(self, du):
+    def forward_U(self, u):
         U = np.zeros([self.Hp,self.nu,self.nVeh])
         Traj = np.zeros([self.Hp,self.ny,self.nVeh])
-        du = du.reshape([self.nu,self.Hu,self.nVeh],order='F')
-
-        # Control values
+        u = u.reshape([self.nu,self.Hp,self.nVeh],order='F')
         for v in range(self.nVeh):
-            U[0,:,v] = du[:,0,v].T + self.Iter.u0[v,:]
-            for k in range(1,self.Hu):
-                U[k,:,v] = du[:,k,v].T + U[k-1,:,v]
-            for k in range(self.Hu,self.Hp):
-                U[k,:,v] = U[self.Hu-1,:,v]
+            U[:,:,v] = u[:,:,v].T
 
         # Predicted trajectory
         for v in range(self.nVeh):
-            X = self.mpc.freeResponse[:,:,v] + self.mpc.Theta[:,:,v] @ du[:,:,v].T
+            X = self.mpc.const_term[:,:,v] + self.mpc.Mathcal_B[:,:,v] @ u[:,:,v].T
             X = X.reshape([self.ny,self.Hp],order='F')
             for i in range(self.ny):
                 Traj[:,i,v] = X[i,:]
         
         return Traj, U
 
-    def QCQP_evaluate(self, deltaU):
+    def QCQP_evaluate(self, U):
         c_linear = 0
         c_quad = 1e9
         objectiveTradeoffCoefficient = 1
@@ -246,22 +224,22 @@ class SCPcontroller():
         constraintValuesVehicle = np.full([self.nVeh,self.nVeh,self.Hp], -np.inf)
         constraintValuesObstacle = np.full([self.nVeh,self.nObst,self.Hp], -np.inf)
         
-        objValue = deltaU.T @ self.qcqp['p0'] @ deltaU + self.qcqp['q0'].T @ deltaU + self.qcqp['r0']
+        objValue = U.T @ self.qcqp['Phi0'] @ U + self.qcqp['Psi0'].T @ U + self.qcqp['gamma0']
         feasibilityScore = objectiveTradeoffCoefficient*objValue
-        feasibilityScoreGradient = objectiveTradeoffCoefficient*((self.qcqp['p0']+self.qcqp['p0'].T) @ deltaU + self.qcqp['q0'])
+        feasibilityScoreGradient = objectiveTradeoffCoefficient*((self.qcqp['Phi0']+self.qcqp['Phi0'].T) @ U + self.qcqp['Psi0'])
 
         for v in range(self.nVeh):
             for k in range(self.Hp):
                 # VEHICLES
                 for v2 in range((v+1),self.nVeh):
-                    ci = deltaU.T @ self.qcqp['p'][v,v2,k,:,:] @ deltaU + self.qcqp['q'][v,v2,k,:,:].T @ deltaU + self.qcqp['r'][v,v2,k]
+                    ci = U.T @ self.qcqp['Phi'][v,v2,k,:,:] @ U + self.qcqp['Psi'][v,v2,k,:,:].T @ U + self.qcqp['gamma'][v,v2,k]
                     constraintValuesVehicle[v,v2,k] = ci
                     constraintValuesVehicle[v2,v,k] = ci
                     feasibilityScore = feasibilityScore + c_quad*max(ci,0)**2 + c_linear*max(ci,0)
                     if (ci > 0):
                         feasibilityScoreGradient = feasibilityScoreGradient + \
-                            (c_quad*2*ci+c_linear)*((self.qcqp['p'][v,v2,k,:,:]+self.qcqp['p'][v,v2,k,:,:].T)@deltaU
-                             + self.qcqp['q'][v,v2,k,:,:])
+                            (c_quad*2*ci+c_linear)*((self.qcqp['Phi'][v,v2,k,:,:]+self.qcqp['Phi'][v,v2,k,:,:].T)@U
+                             + self.qcqp['Psi'][v,v2,k,:,:])
 
                     if (ci > cfg.QCQP.constraintTolerance):
                         feasible = False
@@ -271,13 +249,13 @@ class SCPcontroller():
                     # OBSTACLES
                     if self.nObst:
                         for ob in range(self.nObst):
-                            ci = deltaU.T @ self.qcqp['p_o'][v,ob,k,:,:] @ deltaU + self.qcqp['q_o'][v,ob,k,:,:].T @ deltaU + self.qcqp['r_o'][v,ob,k]
+                            ci = U.T @ self.qcqp['Phi_o'][v,ob,k,:,:] @ U + self.qcqp['Psi_o'][v,ob,k,:,:].T @ U + self.qcqp['gamma_o'][v,ob,k]
                             constraintValuesObstacle[v,ob,k] = ci
                             feasibilityScore = feasibilityScore + c_quad*max(ci,0)**2 + c_linear*max(ci,0)
                             if (ci > 0):
                                 feasibilityScoreGradient = feasibilityScoreGradient + \
-                                    (c_quad*2*ci+c_linear)*((self.qcqp['p_o'][v,ob,k,:,:]+self.qcqp['p_o'][v,ob,k,:,:].T)@deltaU 
-                                    + self.qcqp['q_o'][v,ob,k])
+                                    (c_quad*2*ci+c_linear)*((self.qcqp['Phi_o'][v,ob,k,:,:]+self.qcqp['Phi_o'][v,ob,k,:,:].T)@U 
+                                    + self.qcqp['Psi_o'][v,ob,k])
 
                             if (ci > cfg.QCQP.constraintTolerance):
                                 feasible = False
@@ -285,38 +263,39 @@ class SCPcontroller():
                                 max_violation = max(max_violation,ci)
 
         return feasible, objValue, feasibilityScore, feasibilityScoreGradient, max_violation, sum_violations, constraintValuesVehicle, constraintValuesObstacle
-                            
-                    
-    def convert_to_QCQP(self, scenario):
-        # RESULT FORM:
-        #  x = [ du1; du2;...;dunVeh]
-        #  minimize    x'*p0*x + q0'*x + r0
-        #  subject to  x'*pi*x + qi'*x + ri <= 0,   i = 1,...,m
+
+    def extractor_itau(self, i, tau):
+        assert(tau>self.Hp-1)
+        assert(i>self.nVeh-1)
+        return np.hstack([np.zeros([self.ny,tau*self.ny]), np.eye(self.ny), np.zeros([self.ny,(self.Hp-tau-1)*self.ny])])
+
+    def extractor_ijtau(self, i, j, tau):
+        assert(j<=i)
+        E_itau = self.extractor_itau(i, tau)
+        E_jtau = self.extractor_itau(j, tau)
+        return np.hstack([np.zeros([self.ny, (i)*self.Hp*self.ny]), E_itau, np.zeros([self.ny, (j-i-1)*self.Hp*self.ny]), -E_jtau, self.zeros([self.ny, (self.nVeh-j-1)*self.Hp*self.ny]) ])
+
+    def QCQP_formulate(self, scenario):
         
         # result matrices
-        p0 = np.zeros([self.nVeh*(self.nu*self.Hu),self.nVeh*(self.nu*self.Hu)])
-        q0 = np.zeros([self.nVeh*(self.nu*self.Hu),1])
-        r0 = 0
+        Phi0 = np.zeros([self.nVeh*self.nu*self.Hp,self.nVeh*self.nu*self.Hp])
+        Psi0 = np.zeros([self.nVeh*self.nu*self.Hp,1])
+        gamma0 = 0
 
-        p = np.zeros([self.nVeh-1, self.nVeh, self.Hp, self.nVeh*(self.nu*self.Hu), self.nVeh*(self.nu*self.Hu)])
-        q = np.zeros([self.nVeh-1, self.nVeh, self.Hp, self.nVeh*(self.nu*self.Hu), 1 ])
-        r = np.zeros([self.nVeh-1, self.nVeh, self.Hp])
+        Phi = np.zeros([self.nVeh-1, self.nVeh, self.Hp, self.nVeh*self.nu*self.Hp, self.nVeh*self.nu*self.Hp])
+        Psi = np.zeros([self.nVeh-1, self.nVeh, self.Hp, self.nVeh*self.nu*self.Hp, 1 ])
+        gamma = np.zeros([self.nVeh-1, self.nVeh, self.Hp])
 
-        p_obst = np.zeros([self.nVeh, self.nObst, self.Hp, self.nVeh*(self.nu*self.Hu), self.nVeh*(self.nu*self.Hu)])
-        q_obst = np.zeros([self.nVeh, self.nObst, self.Hp, self.nVeh*(self.nu*self.Hu), 1])
-        r_obst = np.zeros([self.nVeh, self.nObst, self.Hp])
-
+        Phi_obst = np.zeros([self.nVeh, self.nObst, self.Hp, self.nVeh*self.nu*self.Hp, self.nVeh*self.nu*self.Hp])
+        Psi_obst = np.zeros([self.nVeh, self.nObst, self.Hp, self.nVeh*self.nu*self.Hp, 1])
+        gamma_obst = np.zeros([self.nVeh, self.nObst, self.Hp])
+        
         for v in range(self.nVeh):
             # OBJECTIVE FUNCTION MATRICES    
-            veh1_slice = slice(self.nu*self.Hu*v, self.nu*self.Hu*(v+1),1)
-            cooperationCoeff = 1
-            if hasattr(scenario,'CooperationCoefficients'):
-                assert (scenario.CooperationCoefficients.shape[0] == 1) 
-                assert (scenario.CooperationCoefficients.shape[1] == self.nVeh)
-                cooperationCoeff = scenario.CooperationCoefficients[v,0]
-            p0[veh1_slice,veh1_slice] = cooperationCoeff * self.mpc.H[:,:,v]
-            q0[veh1_slice,0] = np.squeeze(cooperationCoeff*self.mpc.g[:,:,v])
-            r0 = r0 + cooperationCoeff*self.mpc.r[:,v]
+            veh1_slice = slice(self.nu*self.Hp*v, self.nu*self.Hp*(v+1),1)
+            Phi0[veh1_slice,veh1_slice] = self.mpc.Phi_0[:,:,v]
+            Psi0[veh1_slice,0] = np.squeeze(self.mpc.Psi_0[:,:,v])
+            gamma0 = gamma0 + self.mpc.gamma_0[:,v]
 
             # CONSTRAINTS MATRICES
             for k in range(self.Hp):
@@ -324,47 +303,47 @@ class SCPcontroller():
                 intv = slice(k*self.ny, (k+1)*self.ny, 1)
                 for v2 in range(v+1, self.nVeh):
 
-                    veh2_slice = slice(v2*self.nu*self.Hu, (v2+1)*self.nu*self.Hu, 1)
+                    veh2_slice = slice(v2*self.nu*self.Hp, (v2+1)*self.nu*self.Hp, 1)
                                 
-                    p[v,v2,k,veh1_slice,veh1_slice]  = - self.mpc.Theta[intv,:, v].T @ self.mpc.Theta[intv,:, v]
-                    p[v,v2,k,veh2_slice,veh2_slice]  = - self.mpc.Theta[intv,:,v2].T @ self.mpc.Theta[intv,:,v2]
-                    p[v,v2,k,veh1_slice,veh2_slice]  =   self.mpc.Theta[intv,:, v].T @ self.mpc.Theta[intv,:,v2]
-                    p[v,v2,k,veh2_slice,veh1_slice]  =   self.mpc.Theta[intv,:,v2].T @ self.mpc.Theta[intv,:, v]
+                    Phi[v,v2,k,veh1_slice,veh1_slice]  = - self.mpc.Mathcal_B[intv,:, v].T @ self.mpc.Mathcal_B[intv,:, v]
+                    Phi[v,v2,k,veh2_slice,veh2_slice]  = - self.mpc.Mathcal_B[intv,:,v2].T @ self.mpc.Mathcal_B[intv,:,v2]
+                    Phi[v,v2,k,veh1_slice,veh2_slice]  =   self.mpc.Mathcal_B[intv,:, v].T @ self.mpc.Mathcal_B[intv,:,v2]
+                    Phi[v,v2,k,veh2_slice,veh1_slice]  =   self.mpc.Mathcal_B[intv,:,v2].T @ self.mpc.Mathcal_B[intv,:, v]
                     
-                    b =  self.mpc.freeResponse[intv,0,v] - self.mpc.freeResponse[intv,0,v2]
+                    b =  self.mpc.const_term[intv,0,v] - self.mpc.const_term[intv,0,v2]
 
-                    q[v,v2,k,veh1_slice,0] = -2*self.mpc.Theta[intv,:, v].T @ b
-                    q[v,v2,k,veh2_slice,0] =  2*self.mpc.Theta[intv,:,v2].T @ b
-                    r[v,v2,k] = (scenario.dsafeVehicles[v,v2] + self.dsafeExtra)**2 - b.T @ b
+                    Psi[v,v2,k,veh1_slice,0] = -2*self.mpc.Mathcal_B[intv,:, v].T @ b
+                    Psi[v,v2,k,veh2_slice,0] =  2*self.mpc.Mathcal_B[intv,:,v2].T @ b
+                    gamma[v,v2,k] = (scenario.dsafeVehicles[v,v2] + self.dsafeExtra)**2 - b.T @ b
                 
                 # OBSTACLE AVOIDANCE
                 # Obstacle in next time step
                 if self.nObst:
                     for o in range(self.nObst): 
-                        p_obst[v,o,k,veh1_slice,veh1_slice] = - self.mpc.Theta[intv,:,v].T @ self.mpc.Theta[intv,:,v]
-                        b = self.mpc.freeResponse[intv,0,v] - self.Iter.obstacleFutureTrajectories[o,:,k].T
-                        q_obst[v,o,k,veh1_slice,0] = -2*self.mpc.Theta[intv,:,v].T @ b
-                        r_obst[v,o,k] = (scenario.dsafeObstacles[v,o] + self.dsafeExtra)**2 - b.T @ b
+                        Phi_obst[v,o,k,veh1_slice,veh1_slice] = - self.mpc.Mathcal_B[intv,:,v].T @ self.mpc.Mathcal_B[intv,:,v]
+                        b = self.mpc.const_term[intv,0,v] - self.Iter.obstacleFutureTrajectories[o,:,k].T
+                        Psi_obst[v,o,k,veh1_slice,0] = -2*self.mpc.Mathcal_B[intv,:,v].T @ b
+                        gamma_obst[v,o,k] = (scenario.dsafeObstacles[v,o] + self.dsafeExtra)**2 - b.T @ b
 
         for v in range(self.nVeh):
             for k in range(self.Hp):
                 for v2 in range(v+1, self.nVeh):
-                    p[v,v2,k,:,:] = 0.5*(p[v,v2,k,:,:]+p[v,v2,k,:,:].T)
+                    Phi[v,v2,k,:,:] = 0.5*(Phi[v,v2,k,:,:]+Phi[v,v2,k,:,:].T)
                 if self.nObst:
                     for o in range(self.nObst):
-                        p_obst[v,o,k,:,:] = 0.5*(p_obst[v,o,k,:,:]+p_obst[v,o,k,:,:].T)
+                        Phi_obst[v,o,k,:,:] = 0.5*(Phi_obst[v,o,k,:,:]+Phi_obst[v,o,k,:,:].T)
 
-        p[abs(p)<=1e-30] = 0
-        q[abs(q)<=1e-30] = 0
+        Phi[abs(Phi)<=1e-30] = 0
+        Psi[abs(Psi)<=1e-30] = 0
         
-        qcqp_dict = {'p0':p0, 'q0':q0, 'r0':r0, 'p':p, 'q':q, 'r':r, 'p_o':p_obst, 'q_o':q_obst, 'r_o':r_obst}
+        qcqp_dict = {'Phi0':Phi0, 'Psi0':Psi0, 'gamma0':gamma0, 'Phi':Phi, 'Psi':Psi, 'gamma':gamma, 'Phi_o':Phi_obst, 'Psi_o':Psi_obst, 'gamma_o':gamma_obst}
             
         return qcqp_dict
     
     def evaluateInOriginalProblem(self, controlPrediction, trajectoryPrediction,options):
         evaluation = {}
         evaluation['predictionObjectiveValueX'] = 0
-        evaluation['predictionObjectiveValueDU'] = 0
+        evaluation['predictionObjectiveValueU'] = 0
         
         # trajectory Prediction  error term
         sqRefErr = (self.Iter.ReferenceTrajectoryPoints-trajectoryPrediction)**2
@@ -374,18 +353,17 @@ class SCPcontroller():
                 self.scenario.Q_final[v] * sqRefErr[-1,:,v].sum()
         
         # steering Prediction term
-        du = np.diff(np.vstack([self.Iter.u0.T, controlPrediction]), axis=0)
-        du = du[0:self.Hu,:]
-        sqDeltaU = du**2
+        u = controlPrediction[0:self.Hp,:]
+        sqU = u**2
         for v in range(self.nVeh):
-            evaluation['predictionObjectiveValueDU'] = evaluation['predictionObjectiveValueDU'] + \
-                self.scenario.R[v] * sqDeltaU[:,v].sum()
+            evaluation['predictionObjectiveValueU'] = evaluation['predictionObjectiveValueU'] + \
+                self.scenario.R[v] * sqU[:,v].sum()
         
-        evaluation['predictionObjectiveValue'] = evaluation['predictionObjectiveValueX'] + evaluation['predictionObjectiveValueDU']    
+        evaluation['predictionObjectiveValue'] = evaluation['predictionObjectiveValueX'] + evaluation['predictionObjectiveValueU']    
         
         # crash prediction check based on QCQP
-        du = du.reshape(du.shape[0]*du.shape[1],1,order='F')
-        evaluation['predictionFeasibleQCQP'],_,_,_,_,_,evaluation['constraintValuesVehicleQCQP'],evaluation['constraintValuesObstacleQCQP'] = self.QCQP_evaluate(du)
+        u = u.reshape(u.shape[0]*u.shape[1],1,order='F')
+        evaluation['predictionFeasibleQCQP'],_,_,_,_,_,evaluation['constraintValuesVehicleQCQP'],evaluation['constraintValuesObstacleQCQP'] = self.QCQP_evaluate(u)
         
         evaluation['constraintValuesVehicle_trajPred'] = np.zeros([self.nVeh,self.nVeh,self.Hp])
         if self.nObst:

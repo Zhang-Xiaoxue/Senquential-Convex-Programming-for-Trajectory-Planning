@@ -36,14 +36,14 @@ class MIQPcontroller():
         self.nObst = scenario.nObst
         self.dsafeExtra = scenario.dsafeExtra
 
-        self.scenario_duLim = scenario.duLim
+        self.scenario_uLim = scenario.uLim
 
         self.mpc = MPCclass(scenario, Iter)
-        self.qcqp = self.convert_to_QCQP(scenario)
-        self.du = np.zeros([self.nVeh*self.Hu,1])
+        self.qcqp = self.QCQP_formulate(scenario)
+        self.u = np.zeros([self.nVeh*self.Hu,1])
     
     def MIQP_controller(self, Iter):
-        MIP, bObstAvoidStart, NOV = self.convert_to_MIP(Iter)
+        MIP, bObstAvoidStart, NOV = self.MIP_formulate(Iter)
 
         # Solving the Optimization Problem
         controllerOutput = {}
@@ -82,12 +82,12 @@ class MIQPcontroller():
                     trajectoryPrediction[k,:,v] = np.squeeze(x_sol[MIP['varIdx']['y'](v,k)])
                     U[k,v] = x_sol[MIP['varIdx']['u'](v,min(k,self.Hu))]     
         else:
-            trajectoryPrediction,U = self.decode_deltaU(np.zeros((self.Hu*self.nVeh,1)))
+            trajectoryPrediction,U = self.forward_U(np.zeros((self.Hu*self.nVeh,1)))
             U = np.squeeze(U[:,0,:])
 
         return U,trajectoryPrediction,controllerOutput
     
-    def convert_to_MIP(self, Iter):
+    def MIP_formulate(self, Iter):
         MIP = {}
         bigM = mip_setting.bigM
         polyDegree = mip_setting.polygonalNormApproximationDegree
@@ -269,8 +269,6 @@ class MIQPcontroller():
 
         assert (rows == nConstraints)
 
-        ## Lower and Upper Bounds
-        # Setting the Lower bounds and Upper Bounds of the control variables and the change of the control variables
         lb = np.full((NOV,1),-np.inf)
         ub = np.full((NOV,1), np.inf)
 
@@ -278,7 +276,7 @@ class MIQPcontroller():
             for k in range(self.Hu):
                 lb[varIdx['u'](v,k)] = -Iter.uMax[0,v]
                 ub[varIdx['u'](v,k)] =  Iter.uMax[0,v]
-                ub[varIdx['deltaCtrl'](v,k)] = self.scenario.duLim
+                ub[varIdx['deltaCtrl'](v,k)] = self.scenario.uLim
 
         ## Specifying the type of each variable in the X 'variables array'.
         ctype = np.empty(NOV)
@@ -299,31 +297,25 @@ class MIQPcontroller():
         
         return MIP, bObstAvoidStart, NOV
 
-    def decode_deltaU(self, du):
+    def forward_U(self, u):
         U = np.zeros([self.Hp,self.nu,self.nVeh])
         Traj = np.zeros([self.Hp,self.ny,self.nVeh])
-        du = du.reshape([self.nu,self.Hu,self.nVeh],order='F')
-
-        # Control values
+        u = u.reshape([self.nu,self.Hu,self.nVeh],order='F')
         for v in range(self.nVeh):
-            U[0,:,v] = du[:,0,v].T + self.Iter.u0[v,:]
-            for k in range(1,self.Hu):
-                U[k,:,v] = du[:,k,v].T + U[k-1,:,v]
-            for k in range(self.Hu,self.Hp):
-                U[k,:,v] = U[self.Hu-1,:,v]
+            U[:,:,v] = u[:,:,v].T
 
         # Predicted trajectory
         for v in range(self.nVeh):
-            X = self.mpc.freeResponse[:,:,v] + self.mpc.Theta[:,:,v] @ du[:,:,v].T
+            X = self.mpc.const_term[:,:,v] + self.mpc.Mathcal_B[:,:,v] @ u[:,:,v].T
             X = X.reshape([self.ny,self.Hp],order='F')
             for i in range(self.ny):
                 Traj[:,i,v] = X[i,:]
         
         return Traj, U
     
-    def convert_to_QCQP(self, scenario):
+    def QCQP_formulate(self, scenario):
         # RESULT FORM:
-        #  x = [ du1; du2;...;dunVeh]
+        #  x = [ u1; u2;...;unVeh]
         #  minimize    x'*p0*x + q0'*x + r0
         #  subject to  x'*pi*x + qi'*x + ri <= 0,   i = 1,...,m
         
@@ -348,9 +340,9 @@ class MIQPcontroller():
                 assert (scenario.CooperationCoefficients.shape[0] == 1) 
                 assert (scenario.CooperationCoefficients.shape[1] == self.nVeh)
                 cooperationCoeff = scenario.CooperationCoefficients[v,0]
-            p0[veh1_slice,veh1_slice] = cooperationCoeff * self.mpc.H[:,:,v]
-            q0[veh1_slice,0] = np.squeeze(cooperationCoeff*self.mpc.g[:,:,v])
-            r0 = r0 + cooperationCoeff*self.mpc.r[:,v]
+            p0[veh1_slice,veh1_slice] = cooperationCoeff * self.mpc.Phi_0[:,:,v]
+            q0[veh1_slice,0] = np.squeeze(cooperationCoeff*self.mpc.Psi_0[:,:,v])
+            r0 = r0 + cooperationCoeff*self.mpc.gamma_0[:,v]
 
             # CONSTRAINTS MATRICES
             for k in range(self.Hp):
@@ -360,24 +352,24 @@ class MIQPcontroller():
 
                     veh2_slice = slice(v2*self.nu*self.Hu, (v2+1)*self.nu*self.Hu, 1)
                                 
-                    p[v,v2,k,veh1_slice,veh1_slice]  = - self.mpc.Theta[intv,:, v].T @ self.mpc.Theta[intv,:, v]
-                    p[v,v2,k,veh2_slice,veh2_slice]  = - self.mpc.Theta[intv,:,v2].T @ self.mpc.Theta[intv,:,v2]
-                    p[v,v2,k,veh1_slice,veh2_slice]  =   self.mpc.Theta[intv,:, v].T @ self.mpc.Theta[intv,:,v2]
-                    p[v,v2,k,veh2_slice,veh1_slice]  =   self.mpc.Theta[intv,:,v2].T @ self.mpc.Theta[intv,:, v]
+                    p[v,v2,k,veh1_slice,veh1_slice]  = - self.mpc.Mathcal_B[intv,:, v].T @ self.mpc.Mathcal_B[intv,:, v]
+                    p[v,v2,k,veh2_slice,veh2_slice]  = - self.mpc.Mathcal_B[intv,:,v2].T @ self.mpc.Mathcal_B[intv,:,v2]
+                    p[v,v2,k,veh1_slice,veh2_slice]  =   self.mpc.Mathcal_B[intv,:, v].T @ self.mpc.Mathcal_B[intv,:,v2]
+                    p[v,v2,k,veh2_slice,veh1_slice]  =   self.mpc.Mathcal_B[intv,:,v2].T @ self.mpc.Mathcal_B[intv,:, v]
                     
-                    b =  self.mpc.freeResponse[intv,0,v] - self.mpc.freeResponse[intv,0,v2]
+                    b =  self.mpc.const_term[intv,0,v] - self.mpc.const_term[intv,0,v2]
 
-                    q[v,v2,k,veh1_slice,0] = -2*self.mpc.Theta[intv,:, v].T @ b
-                    q[v,v2,k,veh2_slice,0] =  2*self.mpc.Theta[intv,:,v2].T @ b
+                    q[v,v2,k,veh1_slice,0] = -2*self.mpc.Mathcal_B[intv,:, v].T @ b
+                    q[v,v2,k,veh2_slice,0] =  2*self.mpc.Mathcal_B[intv,:,v2].T @ b
                     r[v,v2,k] = (scenario.dsafeVehicles[v,v2] + self.dsafeExtra)**2 - b.T @ b
                 
                 # OBSTACLE AVOIDANCE
                 # Obstacle in next time step
                 if self.nObst:
                     for o in range(self.nObst): 
-                        p_obst[v,o,k,veh1_slice,veh1_slice] = - self.mpc.Theta[intv,:,v].T @ self.mpc.Theta[intv,:,v]
-                        b = self.mpc.freeResponse[intv,0,v] - self.Iter.obstacleFutureTrajectories[o,:,k].T
-                        q_obst[v,o,k,veh1_slice,0] = -2*self.mpc.Theta[intv,:,v].T @ b
+                        p_obst[v,o,k,veh1_slice,veh1_slice] = - self.mpc.Mathcal_B[intv,:,v].T @ self.mpc.Mathcal_B[intv,:,v]
+                        b = self.mpc.const_term[intv,0,v] - self.Iter.obstacleFutureTrajectories[o,:,k].T
+                        q_obst[v,o,k,veh1_slice,0] = -2*self.mpc.Mathcal_B[intv,:,v].T @ b
                         r_obst[v,o,k] = (scenario.dsafeObstacles[v,o] + self.dsafeExtra)**2 - b.T @ b
 
         for v in range(self.nVeh):
@@ -395,7 +387,7 @@ class MIQPcontroller():
             
         return qcqp_dict
     
-    def QCQP_evaluate(self, deltaU):
+    def QCQP_evaluate(self, U):
         c_linear = 0
         c_quad = 1e9
         objectiveTradeoffCoefficient = 1
@@ -407,21 +399,21 @@ class MIQPcontroller():
         constraintValuesVehicle = np.full([self.nVeh,self.nVeh,self.Hp], -np.inf)
         constraintValuesObstacle = np.full([self.nVeh,self.nObst,self.Hp], -np.inf)
         
-        objValue = deltaU.T @ self.qcqp['p0'] @ deltaU + self.qcqp['q0'].T @ deltaU + self.qcqp['r0']
+        objValue = U.T @ self.qcqp['p0'] @ U + self.qcqp['q0'].T @ U + self.qcqp['r0']
         feasibilityScore = objectiveTradeoffCoefficient*objValue
-        feasibilityScoreGradient = objectiveTradeoffCoefficient*((self.qcqp['p0']+self.qcqp['p0'].T) @ deltaU + self.qcqp['q0'])
+        feasibilityScoreGradient = objectiveTradeoffCoefficient*((self.qcqp['p0']+self.qcqp['p0'].T) @ U + self.qcqp['q0'])
 
         for v in range(self.nVeh):
             for k in range(self.Hp):
                 # VEHICLES
                 for v2 in range((v+1),self.nVeh):
-                    ci = deltaU.T @ self.qcqp['p'][v,v2,k,:,:] @ deltaU + self.qcqp['q'][v,v2,k,:,:].T @ deltaU + self.qcqp['r'][v,v2,k]
+                    ci = U.T @ self.qcqp['p'][v,v2,k,:,:] @ U + self.qcqp['q'][v,v2,k,:,:].T @ U + self.qcqp['r'][v,v2,k]
                     constraintValuesVehicle[v,v2,k] = ci
                     constraintValuesVehicle[v2,v,k] = ci
                     feasibilityScore = feasibilityScore + c_quad*max(ci,0)**2 + c_linear*max(ci,0)
                     if (ci > 0):
                         feasibilityScoreGradient = feasibilityScoreGradient + \
-                            (c_quad*2*ci+c_linear)*((self.qcqp['p'][v,v2,k,:,:]+self.qcqp['p'][v,v2,k,:,:].T)@deltaU
+                            (c_quad*2*ci+c_linear)*((self.qcqp['p'][v,v2,k,:,:]+self.qcqp['p'][v,v2,k,:,:].T)@U
                              + self.qcqp['q'][v,v2,k,:,:])
 
                     if (ci > cfg.QCQP.constraintTolerance):
@@ -432,12 +424,12 @@ class MIQPcontroller():
                     # OBSTACLES
                     if self.nObst:
                         for ob in range(self.nObst):
-                            ci = deltaU.T @ self.qcqp['p_o'][v,ob,k,:,:] @ deltaU + self.qcqp['q_o'][v,ob,k,:,:].T @ deltaU + self.qcqp['r_o'][v,ob,k]
+                            ci = U.T @ self.qcqp['p_o'][v,ob,k,:,:] @ U + self.qcqp['q_o'][v,ob,k,:,:].T @ U + self.qcqp['r_o'][v,ob,k]
                             constraintValuesObstacle[v,ob,k] = ci
                             feasibilityScore = feasibilityScore + c_quad*max(ci,0)**2 + c_linear*max(ci,0)
                             if (ci > 0):
                                 feasibilityScoreGradient = feasibilityScoreGradient + \
-                                    (c_quad*2*ci+c_linear)*((self.qcqp['p_o'][v,ob,k,:,:]+self.qcqp['p_o'][v,ob,k,:,:].T)@deltaU 
+                                    (c_quad*2*ci+c_linear)*((self.qcqp['p_o'][v,ob,k,:,:]+self.qcqp['p_o'][v,ob,k,:,:].T)@U 
                                     + self.qcqp['q_o'][v,ob,k])
 
                             if (ci > cfg.QCQP.constraintTolerance):
@@ -450,7 +442,7 @@ class MIQPcontroller():
     def evaluateInOriginalProblem(self, controlPrediction, trajectoryPrediction,options):
         evaluation = {}
         evaluation['predictionObjectiveValueX'] = 0
-        evaluation['predictionObjectiveValueDU'] = 0
+        evaluation['predictionObjectiveValueU'] = 0
         
         # trajectory Prediction  error term
         sqRefErr = (self.Iter.ReferenceTrajectoryPoints-trajectoryPrediction)**2
@@ -460,18 +452,17 @@ class MIQPcontroller():
                 self.scenario.Q_final[v] * sqRefErr[-1,:,v].sum()
         
         # steering Prediction term
-        du = np.diff(np.vstack([self.Iter.u0.T, controlPrediction]), axis=0)
-        du = du[0:self.Hu,:]
-        sqDeltaU = du**2
+        u =  controlPrediction[0:self.Hu,:]
+        sqU = u**2
         for v in range(self.nVeh):
-            evaluation['predictionObjectiveValueDU'] = evaluation['predictionObjectiveValueDU'] + \
-                self.scenario.R[v] * sqDeltaU[:,v].sum()
+            evaluation['predictionObjectiveValueU'] = evaluation['predictionObjectiveValueU'] + \
+                self.scenario.R[v] * sqU[:,v].sum()
         
-        evaluation['predictionObjectiveValue'] = evaluation['predictionObjectiveValueX'] + evaluation['predictionObjectiveValueDU']    
+        evaluation['predictionObjectiveValue'] = evaluation['predictionObjectiveValueX'] + evaluation['predictionObjectiveValueU']    
         
         # crash prediction check based on QCQP
-        du = du.reshape(du.shape[0]*du.shape[1],1,order='F')
-        evaluation['predictionFeasibleQCQP'],_,_,_,_,_,evaluation['constraintValuesVehicleQCQP'],evaluation['constraintValuesObstacleQCQP'] = self.QCQP_evaluate(du)
+        u = u.reshape(u.shape[0]*u.shape[1],1,order='F')
+        evaluation['predictionFeasibleQCQP'],_,_,_,_,_,evaluation['constraintValuesVehicleQCQP'],evaluation['constraintValuesObstacleQCQP'] = self.QCQP_evaluate(u)
         
         evaluation['constraintValuesVehicle_trajPred'] = np.zeros([self.nVeh,self.nVeh,self.Hp])
         if self.nObst:
